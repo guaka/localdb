@@ -168,6 +168,8 @@ async fn server_future(listener: TcpListener, router: Router) {
 ///   POST /jobs, GET /jobs/{id}, GET /status, GET /config.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(handlers::get_status_page))
+        .route("/status", get(handlers::get_status_page))
         .route(
             "/v1/stores",
             get(handlers::list_stores).post(handlers::create_store),

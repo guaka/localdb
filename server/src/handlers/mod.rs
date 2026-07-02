@@ -18,6 +18,9 @@
 //!   GET  /jobs/:id                — get job by ID
 //!   GET  /status                  — daemon status
 //!   GET  /config                  — resolved config
+//! Browser routes:
+//!   GET  /                         — local status page
+//!   GET  /status                   — local status page
 
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +39,7 @@ pub use documents::get_document;
 pub use jobs::{create_job, get_job};
 pub use search::search;
 pub use sources::{create_source, delete_source, list_sources};
-pub use status::get_status;
+pub use status::{get_status, get_status_page};
 pub use stores::{create_store, delete_store, get_store, list_stores, patch_store};
 
 #[cfg(test)]

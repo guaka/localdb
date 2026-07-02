@@ -1,15 +1,8 @@
-use axum::{
-    routing::{delete, get, post},
-    Router,
-};
+use axum::Router;
 use serde_json::json;
 use tempfile::TempDir;
 
-use crate::handlers::{
-    create_job, create_source, create_store, delete_source, delete_store, get_config, get_document,
-    get_job, get_status, get_store, list_sources, list_stores, patch_store, search,
-};
-use crate::state::AppState;
+use crate::{build_router, state::AppState};
 
 pub(crate) async fn make_app() -> (TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
@@ -39,26 +32,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
     .await
     .unwrap();
 
-    let router = Router::new()
-        .route("/v1/stores", get(list_stores).post(create_store))
-        .route(
-            "/v1/stores/{name}",
-            get(get_store).patch(patch_store).delete(delete_store),
-        )
-        .route(
-            "/v1/stores/{name}/sources",
-            get(list_sources).post(create_source),
-        )
-        .route("/v1/sources/{id}", delete(delete_source))
-        .route("/v1/documents/{id}", get(get_document))
-        .route("/v1/search", post(search))
-        .route("/v1/jobs", post(create_job))
-        .route("/v1/jobs/{id}", get(get_job))
-        .route("/v1/status", get(get_status))
-        .route("/v1/config", get(get_config))
-        .with_state(state);
-
-    (dir, router)
+    (dir, build_router(state))
 }
 
 pub(crate) async fn json_body(body: axum::body::Body) -> serde_json::Value {

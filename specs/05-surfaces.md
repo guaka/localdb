@@ -46,6 +46,8 @@ later if a consumer demands it).
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
   `metadata: Metadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
   `GET /config` (resolved config).
+- **Browser status:** `GET /` and `GET /status` serve a local HTML status page backed by
+  `GET /v1/status`; these routes are human-facing convenience pages, not versioned API.
 - **Long-running work:** indexing is a **job resource**: `POST /jobs` → `202` + job; clients poll
   `GET /jobs/{id}`. SSE progress streaming is roadmap ([06-roadmap.md](06-roadmap.md) §5) — the
   job resource is designed so SSE adds a representation, not a new model.
