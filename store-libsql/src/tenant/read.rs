@@ -2,7 +2,7 @@ use libsql::params;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{ChunkRecord, Error, MetadataFilter, SearchResult, StoreStats, VectorEncoding};
 
-use super::rows::row_to_chunk_record_strict;
+use super::rows::{row_to_block, row_to_chunk_record_strict};
 use super::sql::{build_filter_clauses, escape_fts5_query};
 use super::TenantStore;
 use crate::connection::map_libsql_err;
@@ -11,20 +11,18 @@ use crate::vectors;
 // Column projection shared across all chunk queries.
 //
 // The `resources` table replaces the old `documents` table. Field name mapping:
-//   resources.id          → ChunkRecord.document_id
-//   resources.ingestor_kind → ChunkRecord.source_kind
 //   resources.added_at    → ChunkRecord.fetched_at
 //   resources.metadata_json → ChunkRecord.metadata
 //
 // Column indices in the SELECT list (used in rows.rs):
 //   0  c.id
-//   1  c.resource_id      (→ document_id)
+//   1  c.resource_id
 //   2  c.text
 //   3  c.heading_path
 //   4  vector_extract(c.embedding) AS embedding_json
 //   5  r.store_id
 //   6  r.source_id
-//   7  r.ingestor_kind    (→ source_kind)
+//   7  r.ingestor_kind
 //   8  r.uri
 //   9  r.title
 //  10  r.mime
@@ -50,7 +48,7 @@ pub(crate) async fn dense_search(
     limit: usize,
     filters: &[MetadataFilter],
 ) -> Result<Vec<SearchResult>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let filter_clauses = build_filter_clauses(filters);
     let encoding = store.encoding();
     let dim = store.embedding_dim();
@@ -144,7 +142,7 @@ pub(crate) async fn bm25_search(
     if query_text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let escaped_query = escape_fts5_query(query_text);
     let filter_clauses = build_filter_clauses(filters);
     let escaped_store_id = store.store_id().replace('\'', "''");
@@ -177,28 +175,27 @@ pub(crate) async fn bm25_search(
 }
 
 pub(crate) async fn stats(store: &TenantStore) -> Result<StoreStats, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
+    // A single statement, not two separate `SELECT COUNT(*)` queries: two
+    // statements read at two different points in time, so a write could
+    // commit between them (in-process now that writes are serialized through
+    // one writer connection, and always possible cross-process) and leave
+    // chunk_count/document_count mutually inconsistent. Both subqueries here
+    // run as one atomic read against a single consistent snapshot.
     let mut rows = conn
         .query(
-            "SELECT COUNT(*) FROM chunks WHERE store_id = ?",
-            params![store.store_id().to_string()],
+            "SELECT (SELECT COUNT(*) FROM chunks WHERE store_id = ?) AS chunk_count,
+                    (SELECT COUNT(*) FROM resources WHERE store_id = ?) AS document_count",
+            params![store.store_id().to_string(), store.store_id().to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
-    let chunk_count = match rows.next().await.map_err(map_libsql_err)? {
-        Some(row) => row.get::<u64>(0).map_err(map_libsql_err)?,
-        None => 0,
-    };
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM resources WHERE store_id = ?",
-            params![store.store_id().to_string()],
-        )
-        .await
-        .map_err(map_libsql_err)?;
-    let document_count = match rows.next().await.map_err(map_libsql_err)? {
-        Some(row) => row.get::<u64>(0).map_err(map_libsql_err)?,
-        None => 0,
+    let (chunk_count, document_count) = match rows.next().await.map_err(map_libsql_err)? {
+        Some(row) => (
+            row.get::<u64>(0).map_err(map_libsql_err)?,
+            row.get::<u64>(1).map_err(map_libsql_err)?,
+        ),
+        None => (0, 0),
     };
     Ok(StoreStats {
         chunk_count,
@@ -210,7 +207,7 @@ pub(crate) async fn get_chunk(
     store: &TenantStore,
     chunk_id: &str,
 ) -> Result<Option<ChunkRecord>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             &format!(
@@ -229,12 +226,11 @@ pub(crate) async fn get_chunk(
     }
 }
 
-pub(crate) async fn get_chunks_for_document(
+pub(crate) async fn get_chunks_for_resource(
     store: &TenantStore,
-    document_id: &str,
+    resource_id: &str,
 ) -> Result<Vec<ChunkRecord>, Error> {
-    let conn = store.conn().conn().await;
-    // `document_id` maps to `resource_id` in the new schema.
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             &format!(
@@ -244,7 +240,7 @@ pub(crate) async fn get_chunks_for_document(
                  WHERE c.store_id = ? AND c.resource_id = ?
                  ORDER BY c.block_seq, c.seq_in_block"
             ),
-            params![store.store_id().to_string(), document_id.to_string()],
+            params![store.store_id().to_string(), resource_id.to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
@@ -255,14 +251,42 @@ pub(crate) async fn get_chunks_for_document(
     Ok(out)
 }
 
+/// Retrieve all blocks for a document, ordered by `seq`.
+///
+/// Backs `RetrievalStore::get_blocks_for_resource`. Blocks are the persisted
+/// canonical source of truth for document reconstruction — see
+/// `write::upsert_blocks`/`write::upsert_blocks_inner` and the trait doc on
+/// `get_blocks_for_resource` in `core::store`.
+pub(crate) async fn get_blocks_for_resource(
+    store: &TenantStore,
+    resource_id: &str,
+) -> Result<Vec<localdb_core::block::Block>, Error> {
+    let conn = store.conn().reader();
+    let mut rows = conn
+        .query(
+            "SELECT seq, kind, text, metadata_json, location_json
+             FROM blocks
+             WHERE store_id = ? AND resource_id = ?
+             ORDER BY seq",
+            params![store.store_id().to_string(), resource_id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+        out.push(row_to_block(&row)?);
+    }
+    Ok(out)
+}
+
 pub(crate) async fn list_indexed_documents(
     store: &TenantStore,
 ) -> Result<Vec<DocumentRecord>, Error> {
-    let conn = store.conn().conn().await;
-    // `resources.id` maps back to `DocumentRecord.document_id`.
+    let conn = store.conn().reader();
+    // `resources.id` maps back to `DocumentRecord.resource_id`.
     let mut rows = conn
         .query(
-            "SELECT id, uri, content_hash, policy_version
+            "SELECT id, uri, content_hash, policy_version, source_id
              FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
@@ -271,10 +295,11 @@ pub(crate) async fn list_indexed_documents(
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
         out.push(DocumentRecord {
-            document_id: row.get(0).map_err(map_libsql_err)?,
+            resource_id: row.get(0).map_err(map_libsql_err)?,
             uri: row.get(1).map_err(map_libsql_err)?,
             content_hash: row.get(2).map_err(map_libsql_err)?,
             policy_version: row.get(3).map_err(map_libsql_err)?,
+            source_id: row.get(4).map_err(map_libsql_err)?,
         });
     }
     Ok(out)

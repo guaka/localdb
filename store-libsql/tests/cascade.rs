@@ -14,7 +14,7 @@
 
 use tempfile::tempdir;
 
-use localdb_core::parser::DocumentMetadata;
+use localdb_core::metadata::Metadata;
 use localdb_core::store::ChunkRecord;
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
 use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
@@ -59,6 +59,7 @@ async fn seed_store(db: &SqliteBackend, store_id: &str, n_chunks: usize) {
         preset: "prose".to_string(),
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
     })
     .await
     .unwrap();
@@ -74,7 +75,7 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
     let text = format!("chunk {idx} of {store_id} alpha beta gamma");
     ChunkRecord {
         id: format!("chunk-{store_id}-{idx}"),
-        document_id: format!("doc-{store_id}"),
+        resource_id: format!("doc-{store_id}"),
         store_id: store_id.to_string(),
         text: text.clone(),
         span: Span::new(idx * 100, idx * 100 + text.len()),
@@ -85,13 +86,15 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
         content_hash: format!("hash-{store_id}"),
         origin_store: store_id.to_string(),
         source_id: source_id.to_string(),
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: format!("file:///data/{store_id}/doc.md"),
-        metadata: DocumentMetadata::default(),
+        metadata: Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
+        window_block_seqs: vec![],
     }
 }
 
@@ -195,5 +198,64 @@ async fn delete_source_cascades_to_documents_and_chunks() {
             .unwrap()
             .is_empty(),
         "FTS should reflect the cascade"
+    );
+}
+
+/// Issue #116: a feed source (`kind = 'feed'`, `root` NULL) must cascade
+/// identically to path/url sources — the FK chain and CHECK constraint
+/// changes for feed sources must not weaken the existing cascade guarantee.
+#[tokio::test]
+async fn delete_feed_source_cascades_to_documents_and_chunks() {
+    let (_dir, db) = open_db().await;
+
+    let store_id = "tenant-feed";
+    db.upsert_store(&StoreRow {
+        id: store_id.to_string(),
+        name: store_id.to_string(),
+        visibility: StoreVisibility::Private,
+        backend: "libsql".to_string(),
+        indexing_policy: "{}".to_string(),
+        policy_version: "v1".to_string(),
+        acl: "{}".to_string(),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let source_id = format!("src-{store_id}");
+    db.upsert_source(&SourceRow {
+        id: source_id.clone(),
+        store_id: store_id.to_string(),
+        kind: SourceKind::Feed,
+        root: None,
+        url: Some("https://example.com/feed.xml".to_string()),
+        include: vec![],
+        exclude: vec![],
+        preset: "prose".to_string(),
+        refresh: Some("24h".to_string()),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: Some(r#"{"max_entries":null,"fetch_full_content":true}"#.to_string()),
+    })
+    .await
+    .unwrap();
+
+    let handle = db.retrieval_store(store_id).await.unwrap();
+    let records: Vec<ChunkRecord> = (0..3)
+        .map(|i| make_record(store_id, &source_id, i))
+        .collect();
+    handle.upsert_chunks(records).await.unwrap();
+
+    assert_eq!(handle.stats().await.unwrap().chunk_count, 3);
+
+    assert!(db.delete_source(&source_id).await.unwrap());
+
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(
+        stats.chunk_count, 0,
+        "chunks should cascade when a feed source is deleted"
+    );
+    assert_eq!(
+        stats.document_count, 0,
+        "documents should cascade when a feed source is deleted"
     );
 }

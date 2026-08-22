@@ -1,16 +1,41 @@
 [package]
-name = "mcp"
+name = "localdb-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
-description = "MCP server over stdio: read-only search, get_document, list_stores"
+description = "MCP server (stdio and HTTP): read-only search, get_document, get_chunks, list_stores"
+
+[lib]
+# Keep the short crate name in code (`use mcp::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "mcp"
 
 [dependencies]
-localdb-core = { path = "../core" }
+localdb-core = { path = "../core", version = "0.1.0" }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true }
+anyhow = { workspace = true }
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "macros",
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 
 [dev-dependencies]
 localdb-core = { path = "../core", features = ["test-support"] }
+
+# Real HTTP server + listener for the proxy-transparency test
+# (mcp/tests/mcp_proxy.rs), which needs a genuine socket for rmcp's
+# Streamable HTTP client transport — not used by any non-test code, which
+# only ever gets a concrete tower::Service back from
+# `build_streamable_http_service` (see `http.rs`).
+axum = { workspace = true }

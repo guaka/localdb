@@ -7,12 +7,21 @@
 pub mod progress;
 
 mod app_db;
+mod command_table;
 mod daemon_client;
+mod job_attach;
 mod normalize;
+mod scaffold;
 
 mod cmds {
+    pub(crate) mod completions;
+    pub(crate) mod db;
+    pub(crate) mod document;
     pub(crate) mod index;
     pub(crate) mod init;
+    pub(crate) mod internal;
+    pub(crate) mod job;
+    pub(crate) mod listing;
     pub(crate) mod search;
     pub(crate) mod source;
     pub(crate) mod status;
@@ -21,8 +30,13 @@ mod cmds {
 }
 
 pub use app_db::AppDb;
+pub use cmds::completions::{run_completions, Shell};
+pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status, run_db_vacuum};
+pub use cmds::document::{run_document_get, run_document_list};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
+pub use cmds::internal::run_internal_print_schema;
+pub use cmds::job::{run_job_cancel, run_job_list};
 pub use cmds::search::run_search;
 pub use cmds::source::{run_source_add, run_source_list, run_source_remove};
 pub use cmds::status::run_status;

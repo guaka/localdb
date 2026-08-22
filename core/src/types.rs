@@ -190,7 +190,7 @@ pub struct Source {
     pub spec: SourceSpec,
 
     /// Which indexing preset applies ("prose", "messages", "code").
-    pub source_kind_preset: String,
+    pub source_preset: String,
 }
 
 /// Source kind.
@@ -199,6 +199,7 @@ pub struct Source {
 pub enum SourceKind {
     Path,
     Url,
+    Feed,
 }
 
 /// Source spec — kind-specific configuration.
@@ -222,6 +223,28 @@ pub enum SourceSpec {
         #[serde(default)]
         refresh_interval_secs: Option<u64>,
     },
+    Feed {
+        /// The Atom/RSS feed URL.
+        url: String,
+        /// Cap on entries considered per run (`None` = unbounded). A feed
+        /// only ever exposes its most recent N entries, so this bounds how
+        /// many of those are processed, not how many exist historically.
+        #[serde(default)]
+        max_entries: Option<u32>,
+        /// Whether to follow each entry's link and fetch the full page
+        /// content, or index only the feed-supplied summary/content.
+        #[serde(default = "default_true")]
+        fetch_full_content: bool,
+        /// Refresh interval in seconds.
+        #[serde(default)]
+        refresh_interval_secs: Option<u64>,
+    },
+}
+
+/// `serde(default = "default_true")` helper: feed sources default to
+/// fetching full entry content when `fetch_full_content` is omitted.
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -354,16 +377,16 @@ pub fn validate_msg_meta_key(key: &str) -> Result<(), String> {
 
 /// The retrieval unit: what gets embedded and indexed.
 ///
-/// ID is content-addressed: `blake3(document_id || chunk_text || span)`.
+/// ID is content-addressed: `blake3(resource_id || chunk_text || span)`.
 ///
 /// See specs/02-domain-model.md §2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Chunk {
-    /// Content-addressed ID: `blake3(document_id || chunk_text || span_start || span_end)`.
+    /// Content-addressed ID: `blake3(resource_id || chunk_text || span_start || span_end)`.
     pub id: ContentId,
 
     /// Parent document ID.
-    pub document_id: ContentId,
+    pub resource_id: ContentId,
 
     /// Owning store ID.
     pub store_id: UlidId,
@@ -385,6 +408,11 @@ pub struct Chunk {
     /// Provenance copied from document.
     /// Chunks must be self-describing for federation.
     pub provenance: Provenance,
+
+    /// For message-window chunks: all block seqs participating in the window.
+    /// Empty for non-window chunks (the common case).
+    #[serde(default)]
+    pub window_block_seqs: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -418,10 +446,26 @@ pub struct IndexJob {
     #[serde(default)]
     pub error: Option<String>,
 
+    /// Stable machine-readable error code (`Error::code()`) if state is
+    /// `Failed` and the failure came from a typed `core::Error` — `None` for
+    /// a synthetic queue-level failure (e.g. "job queue is full or closed",
+    /// a task panic) that never had one. `#[serde(default)]` so an older
+    /// daemon's job JSON (predating this field) still deserializes.
+    /// `cli::job_attach::finish_job` reconstructs the original typed error
+    /// via `Error::from_code(error_code, error)` so a daemon-attached job
+    /// failure exits with the same code an embedded pre-flight failure of
+    /// the same kind would (issue #187 review).
+    #[serde(default)]
+    pub error_code: Option<String>,
+
     /// When the job was created (RFC 3339).
     pub created_at: String,
 
-    /// When the job started running (RFC 3339), if it has.
+    /// When the job started running (RFC 3339), if it has. `None` for a
+    /// still-`Pending` job, and also stays `None` on a job cancelled while
+    /// still `Pending` (see [`IndexJobState`]'s doc comment) even though
+    /// that job is terminal — `completed_at.is_some()` does not imply
+    /// `started_at.is_some()`.
     #[serde(default)]
     pub started_at: Option<String>,
 
@@ -439,10 +483,28 @@ pub enum IndexJobScope {
     /// One source.
     Source { source_id: UlidId },
     /// One document.
-    Document { document_id: ContentId },
+    Document { resource_id: ContentId },
 }
 
 /// State of an index job: pending → running → done | failed.
+///
+/// One edge is not on that spine: `pending → failed` directly. Two distinct
+/// producers reach it, both leaving
+/// `started_at: None` (the job never ran) while `completed_at` is set (it
+/// did reach a terminal state):
+/// - An operator cancels a job that is still queued, before the worker ever
+///   starts it (issue #218) — `error_code: "job_cancelled"`.
+/// - `JobQueue::submit` fails to hand the job to a worker at all (the
+///   channel is full or already closed) — a synthetic queue-level failure
+///   with `error_code: None` (`fail_index_job`, not
+///   `fail_index_job_with_error`), same as any other producer that never
+///   had a typed `core::Error` to carry.
+///
+/// Every other terminal job has `started_at: Some(_)`, since `running →
+/// done`/`running → failed` are the only other ways to reach a terminal
+/// state. A consumer must not assume `completed_at.is_some() implies
+/// started_at.is_some()` (e.g. when computing a duration) for exactly this
+/// reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexJobState {
@@ -453,26 +515,48 @@ pub enum IndexJobState {
 }
 
 /// Statistics accumulated during indexing.
+///
+/// `#[serde(default)]` at the struct level (issue #187 stage 3): a job
+/// producer (or a test fixture) may omit any subset of these fields and
+/// still deserialize cleanly, with the omitted fields defaulting to 0 —
+/// important now that `IndexJob`s cross the wire (`GET
+/// /v1/jobs/{id}/events`'s terminal `job` frame) to a CLI that only cares
+/// about a few of them in most cases.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct IndexJobStats {
     /// Documents seen in the scan.
     pub docs_seen: u64,
     /// Documents actually indexed (new or changed).
     pub docs_indexed: u64,
+    /// Documents skipped (unchanged content hash).
+    pub docs_skipped: u64,
     /// Documents deleted (source removed them).
     pub docs_deleted: u64,
+    /// Documents that would have been deleted had deletion been enabled
+    /// (`DeletionPolicy::Retain` ran instead of `Prune`) — mirrors
+    /// `IngestionResult::docs_prunable`, surfaced here so a daemon-submitted
+    /// job can report the same "N no longer at source (kept; use --delete to
+    /// remove)" information the embedded CLI path already does.
+    pub docs_prunable: u64,
     /// Chunks written to the retrieval backend.
     pub chunks_written: u64,
     /// Files that could not be indexed due to unsupported format.
     pub unsupported_format_count: u64,
     /// Files that errored during indexing.
     pub error_count: u64,
+    /// Number of sources the job's scope resolved to, before any were
+    /// processed. Distinguishes "this store/source had nothing to index" (0)
+    /// from "sources existed but nothing needed indexing" (>0, all other
+    /// counters 0) — the same distinction `IndexSummary::has_sources` makes
+    /// on the CLI side (issue #187 stage 3).
+    pub sources_count: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{chunk_id, content_hash, document_id, new_ulid};
+    use crate::ids::{chunk_id, content_hash, new_ulid, resource_id};
 
     fn make_provenance() -> Provenance {
         Provenance {
@@ -563,7 +647,7 @@ mod tests {
                 include: vec!["**/*.md".to_string()],
                 exclude: vec![".git/**".to_string()],
             },
-            source_kind_preset: "prose".to_string(),
+            source_preset: "prose".to_string(),
         };
         let json = serde_json::to_string(&source).unwrap();
         let source2: Source = serde_json::from_str(&json).unwrap();
@@ -580,11 +664,70 @@ mod tests {
                 url: "https://example.com/docs".to_string(),
                 refresh_interval_secs: Some(3600),
             },
-            source_kind_preset: "prose".to_string(),
+            source_preset: "prose".to_string(),
         };
         let json = serde_json::to_string(&source).unwrap();
         let source2: Source = serde_json::from_str(&json).unwrap();
         assert_eq!(source, source2);
+    }
+
+    #[test]
+    fn feed_source_serializes_roundtrip() {
+        let source = Source {
+            id: new_ulid(),
+            store_id: new_ulid(),
+            kind: SourceKind::Feed,
+            spec: SourceSpec::Feed {
+                url: "https://example.com/feed.xml".to_string(),
+                max_entries: Some(50),
+                fetch_full_content: false,
+                refresh_interval_secs: Some(3600),
+            },
+            source_preset: "prose".to_string(),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        let source2: Source = serde_json::from_str(&json).unwrap();
+        assert_eq!(source, source2);
+    }
+
+    #[test]
+    fn feed_source_spec_serializes_with_tag_feed() {
+        let spec = SourceSpec::Feed {
+            url: "https://example.com/feed.xml".to_string(),
+            max_entries: None,
+            fetch_full_content: true,
+            refresh_interval_secs: None,
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("feed"));
+    }
+
+    #[test]
+    fn feed_source_kind_serializes_lowercase() {
+        let json = serde_json::to_value(SourceKind::Feed).unwrap();
+        assert_eq!(json, serde_json::json!("feed"));
+    }
+
+    #[test]
+    fn feed_source_spec_omitted_fetch_full_content_defaults_true() {
+        let json = r#"{"type": "feed", "url": "https://example.com/feed.xml"}"#;
+        let spec: SourceSpec = serde_json::from_str(json).unwrap();
+        match spec {
+            SourceSpec::Feed {
+                fetch_full_content,
+                max_entries,
+                refresh_interval_secs,
+                ..
+            } => {
+                assert!(
+                    fetch_full_content,
+                    "fetch_full_content must default to true"
+                );
+                assert_eq!(max_entries, None);
+                assert_eq!(refresh_interval_secs, None);
+            }
+            _ => panic!("expected feed spec"),
+        }
     }
 
     // --- Document tests ---
@@ -593,7 +736,7 @@ mod tests {
     fn document_serializes_roundtrip() {
         let hash = content_hash("some document content");
         let doc = Document {
-            id: document_id("file:///docs/readme.md", &hash),
+            id: resource_id("file:///docs/readme.md", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "file:///docs/readme.md".to_string(),
@@ -626,7 +769,7 @@ mod tests {
         meta.insert("msg.channel".to_string(), serde_json::json!("#general"));
 
         let doc = Document {
-            id: document_id("imap://acct/folder;uid=1", &hash),
+            id: resource_id("imap://acct/folder;uid=1", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "imap://acct/folder;uid=1".to_string(),
@@ -650,7 +793,7 @@ mod tests {
         meta.insert("msg.unknown_key".to_string(), serde_json::json!("value"));
 
         let doc = Document {
-            id: document_id("file:///test.md", &hash),
+            id: resource_id("file:///test.md", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "file:///test.md".to_string(),
@@ -675,7 +818,7 @@ mod tests {
         meta.insert("app_specific".to_string(), serde_json::json!(42));
 
         let doc = Document {
-            id: document_id("file:///test.md", &hash),
+            id: resource_id("file:///test.md", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "file:///test.md".to_string(),
@@ -712,24 +855,52 @@ mod tests {
 
     #[test]
     fn chunk_serializes_roundtrip() {
-        let doc_id = document_id("file:///docs/api.md", &content_hash("doc content"));
+        let doc_id = resource_id("file:///docs/api.md", &content_hash("doc content"));
         let text = "This is a chunk of text.";
         let span = Span::new(0, text.len());
-        let id = chunk_id(&doc_id, text, span.start, span.end, 0);
+        let id = chunk_id(&doc_id, 0, text, 0);
 
         let chunk = Chunk {
             id,
-            document_id: doc_id,
+            resource_id: doc_id,
             store_id: new_ulid(),
             text: text.to_string(),
             span,
             heading_path: vec!["API".to_string(), "Introduction".to_string()],
             policy_version: "abc123def456".to_string(),
             provenance: make_provenance(),
+            window_block_seqs: vec![],
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let chunk2: Chunk = serde_json::from_str(&json).unwrap();
         assert_eq!(chunk, chunk2);
+    }
+
+    #[test]
+    fn chunk_window_block_seqs_defaults_empty_on_missing_field() {
+        // Old JSON, written before window_block_seqs existed, must still deserialize.
+        let doc_id = resource_id("file:///docs/api.md", &content_hash("doc content"));
+        let text = "This is a chunk of text.";
+        let json = format!(
+            r#"{{
+                "id": "{id}",
+                "resource_id": "{doc_id}",
+                "store_id": "store-1",
+                "text": "{text}",
+                "span": {{"start": 0, "end": {len}}},
+                "policy_version": "v1",
+                "provenance": {{
+                    "origin_store": "store-1",
+                    "source_ref": {{"id": "src-1", "kind": "path"}},
+                    "fetched_at": "2026-06-10T12:00:00Z",
+                    "content_hash": "abc123"
+                }}
+            }}"#,
+            id = chunk_id(&doc_id, 0, text, 0),
+            len = text.len(),
+        );
+        let chunk: Chunk = serde_json::from_str(&json).unwrap();
+        assert!(chunk.window_block_seqs.is_empty());
     }
 
     // --- IndexJob tests ---
@@ -743,6 +914,7 @@ mod tests {
             state: IndexJobState::Pending,
             stats: IndexJobStats::default(),
             error: None,
+            error_code: None,
             created_at: "2026-06-10T12:00:00Z".to_string(),
             started_at: None,
             completed_at: None,
@@ -750,6 +922,25 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let job2: IndexJob = serde_json::from_str(&json).unwrap();
         assert_eq!(job, job2);
+    }
+
+    #[test]
+    fn index_job_error_code_defaults_to_none_when_absent_from_json() {
+        // A daemon predating this field (issue #187 review) emits `IndexJob`
+        // JSON with no `error_code` key at all — `#[serde(default)]` must
+        // still deserialize it, not fail the whole response.
+        let json = r#"{
+            "id": "job-1",
+            "store_id": "store-1",
+            "scope": {"type": "store"},
+            "state": "failed",
+            "stats": {},
+            "error": "boom",
+            "created_at": "2026-06-10T12:00:00Z"
+        }"#;
+        let job: IndexJob = serde_json::from_str(json).unwrap();
+        assert_eq!(job.error_code, None);
+        assert_eq!(job.error, Some("boom".to_string()));
     }
 
     #[test]
@@ -793,9 +984,9 @@ mod tests {
 
     #[test]
     fn index_job_scope_document_roundtrip() {
-        let doc_id = document_id("file:///test.md", &content_hash("content"));
+        let doc_id = resource_id("file:///test.md", &content_hash("content"));
         let scope = IndexJobScope::Document {
-            document_id: doc_id,
+            resource_id: doc_id,
         };
         let json = serde_json::to_string(&scope).unwrap();
         let scope2: IndexJobScope = serde_json::from_str(&json).unwrap();

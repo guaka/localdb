@@ -64,7 +64,7 @@ impl<'a> Probe<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// ParsedDocument + DocumentMetadata
+// ParsedDocument
 // ---------------------------------------------------------------------------
 
 /// A parsed document: Markdown-normalized content and metadata.
@@ -77,31 +77,18 @@ pub struct ParsedDocument {
     pub markdown: String,
     /// Title from extraction (kept as a typed fast-path).
     pub title: Option<String>,
-    /// Document metadata extracted from the document.
-    pub metadata: DocumentMetadata,
-}
-
-/// Dublin Core Metadata Element Set 1.1 (DCMES), all 15 elements.
-///
-/// Repeatable elements use `Vec`; singleton elements use `Option<String>`.
-/// Persisted as a single JSON-encoded UTF-8 column in LanceDB.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DocumentMetadata {
-    pub title: Option<String>,
-    pub creator: Vec<String>,
-    pub subject: Vec<String>,
-    pub description: Option<String>,
-    pub publisher: Option<String>,
-    pub contributor: Vec<String>,
-    pub date: Option<String>,
-    pub r#type: Option<String>,
-    pub format: Option<String>,
-    pub identifier: Option<String>,
-    pub source: Option<String>,
-    pub language: Option<String>,
-    pub relation: Vec<String>,
-    pub coverage: Option<String>,
-    pub rights: Option<String>,
+    /// Dublin Core metadata extracted from the document.
+    ///
+    /// See `crate::metadata::DublinCoreMetadata` — persisted (wrapped in the
+    /// tagged `crate::metadata::Metadata` enum) as a JSON-encoded column in
+    /// the libsql store.
+    pub metadata: crate::metadata::DublinCoreMetadata,
+    /// For paginated source formats (today: PDF): `(byte_offset, page_number)`
+    /// for every page that contributed content, ascending in both fields.
+    /// `byte_offset` indexes into `markdown`; `page_number` is 1-based.
+    /// Empty for non-paginated formats — block building then leaves
+    /// `Block.location` untouched.
+    pub page_starts: Vec<(usize, u32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +99,15 @@ pub struct DocumentMetadata {
 ///
 /// Implementors inspect the `Probe` and either decline (`Ok(None)`), handle
 /// (`Ok(Some(doc))`), or fail a recognized format (`Err(e)`). The trait is
-/// **sync** (CPU-bound); callers run it under `spawn_blocking`.
+/// **sync** (CPU-bound); callers on a shared async runtime must not call
+/// `parse` inline. In practice callers use [`crate::blocking::run_blocking`]
+/// (`tokio::task::block_in_place` on a multi-thread runtime, inline
+/// otherwise — see its doc comment) rather than `spawn_blocking`: `parse`
+/// borrows caller-local state (parser chain, probe bytes) that would need to
+/// be `'static` and moved to satisfy `spawn_blocking`'s bound, which
+/// `run_blocking`'s same-thread `block_in_place` doesn't require. See
+/// `ingest/src/file_ingestor.rs` and `ingest/src/url_pipeline.rs` for the
+/// call sites this backs.
 pub trait Parser: Send + Sync {
     /// Stable id used in the config `parsers:` list and in diagnostics.
     fn id(&self) -> &'static str;
@@ -335,7 +330,7 @@ mod tests {
 
     #[test]
     fn dublin_core_default_is_empty() {
-        let dc = DocumentMetadata::default();
+        let dc = crate::metadata::DublinCoreMetadata::default();
         assert!(dc.title.is_none());
         assert!(dc.creator.is_empty());
         assert!(dc.subject.is_empty());
@@ -345,14 +340,14 @@ mod tests {
 
     #[test]
     fn dublin_core_roundtrips_json() {
-        let dc = DocumentMetadata {
+        let dc = crate::metadata::DublinCoreMetadata {
             title: Some("Test Document".to_string()),
             creator: vec!["Alice".to_string(), "Bob".to_string()],
             date: Some("2026-06-13".to_string()),
             ..Default::default()
         };
         let json = serde_json::to_string(&dc).unwrap();
-        let dc2: DocumentMetadata = serde_json::from_str(&json).unwrap();
+        let dc2: crate::metadata::DublinCoreMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(dc, dc2);
     }
 
@@ -361,7 +356,7 @@ mod tests {
         let doc = ParsedDocument::default();
         assert!(doc.markdown.is_empty());
         assert!(doc.title.is_none());
-        assert_eq!(doc.metadata, DocumentMetadata::default());
+        assert_eq!(doc.metadata, crate::metadata::DublinCoreMetadata::default());
     }
 
     #[test]

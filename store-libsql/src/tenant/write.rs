@@ -4,8 +4,41 @@ use libsql::{params, Connection};
 use localdb_core::{ChunkRecord, Error, VectorEncoding};
 
 use super::TenantStore;
-use crate::connection::map_libsql_err;
+use crate::connection::{map_libsql_err, WriteTx};
 use crate::vectors;
+
+/// Commit `result`'s transaction on `Ok`, roll back explicitly on `Err`
+/// (logging a rollback failure rather than propagating it), returning the
+/// original error either way — that's the failure the caller actually needs
+/// to see and react to.
+///
+/// Explicit rollback here — not `WriteTx`'s `Drop` backstop — is the primary
+/// error path: `commit()`/`rollback()` return a `Result` we can log and
+/// handle, which Drop's own rollback can't (it panics on failure instead).
+/// That said, this isn't fully panic-proof either — see
+/// [`crate::connection::WriteTx`]'s doc comment for the caveat: a
+/// persistently-failing COMMIT/ROLLBACK can still panic inside libsql before
+/// this function's error handling ever runs. Do not "simplify" the arms
+/// below away in favor of Drop on the strength of that caveat — explicit
+/// remains strictly better, handling and logging every failure Drop can't
+/// return at all.
+async fn finish_write_tx<T>(tx: WriteTx<'_>, result: Result<T, Error>) -> Result<T, Error> {
+    match result {
+        Ok(v) => {
+            tx.commit().await?;
+            Ok(v)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::error!(
+                    error = %rollback_err,
+                    "explicit rollback after write failure also failed"
+                );
+            }
+            Err(e)
+        }
+    }
+}
 
 pub(crate) async fn upsert_chunks(
     store: &TenantStore,
@@ -21,38 +54,49 @@ pub(crate) async fn upsert_chunks(
             ));
         }
     }
-    let conn = store.conn().conn().await;
     let count = records.len();
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = upsert_chunks_inner(&conn, &records, store.encoding()).await;
-    match inner {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    let tx = store.conn().write_tx().await?;
+    let result = upsert_chunks_inner(&tx, &records, store.encoding())
+        .await
+        .map(|()| count);
+    finish_write_tx(tx, result).await
 }
 
-pub(crate) async fn delete_by_document(
+pub(crate) async fn delete_by_resource(
     store: &TenantStore,
-    document_id: &str,
+    resource_id: &str,
 ) -> Result<usize, Error> {
-    let conn = store.conn().conn().await;
-    // `document_id` on ChunkRecord maps to `resource_id` in the schema.
+    let tx = store.conn().write_tx().await?;
+    let result = delete_document_inner(&tx, store.store_id(), resource_id).await;
+    finish_write_tx(tx, result).await
+}
+
+/// Connection-level helper: delete all chunks and the resource row for a
+/// single document (`blocks` are removed via `ON DELETE CASCADE` from
+/// `resources`).
+///
+/// This is the shared implementation behind both the standalone
+/// `delete_by_resource` (wrapped in its own `write_tx`, used for source
+/// removal / store clearing) and the in-transaction delete performed by
+/// `upsert_chunks_and_blocks` when replacing a document (issue #79): the
+/// latter runs this against the transaction's own connection, before the
+/// replacement insert, so a failure anywhere in that transaction rolls back
+/// the delete along with the insert.
+async fn delete_document_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<usize, Error> {
     let chunk_count = conn
         .execute(
             "DELETE FROM chunks WHERE store_id = ? AND resource_id = ?",
-            params![store.store_id().to_string(), document_id.to_string()],
+            params![store_id.to_string(), resource_id.to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
     conn.execute(
         "DELETE FROM resources WHERE store_id = ? AND id = ?",
-        params![store.store_id().to_string(), document_id.to_string()],
+        params![store_id.to_string(), resource_id.to_string()],
     )
     .await
     .map_err(map_libsql_err)?;
@@ -66,7 +110,12 @@ pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Resu
             handle = store.store_id()
         ));
     }
-    let conn = store.conn().conn().await;
+    let tx = store.conn().write_tx().await?;
+    let result = delete_by_store_inner(&tx, store_id).await;
+    finish_write_tx(tx, result).await
+}
+
+async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usize, Error> {
     let chunk_count = conn
         .execute(
             "DELETE FROM chunks WHERE store_id = ?",
@@ -92,43 +141,12 @@ fn tenant_violation<T>(message: String) -> Result<T, Error> {
 
 pub(crate) async fn upsert_blocks(
     store: &TenantStore,
-    document_id: &str,
+    resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
-    let conn = store.conn().conn().await;
-    for block in blocks {
-        let kind_str = block.kind.kind_str();
-        let metadata_json =
-            serde_json::to_string(&block.kind).map_err(|e| localdb_core::Error::Internal {
-                message: format!("block metadata serialize: {e}"),
-                correlation_id: "store_upsert_blocks_meta".to_string(),
-            })?;
-        let location_json = block
-            .location
-            .as_ref()
-            .map(|loc| serde_json::to_string(loc).unwrap_or_default());
-        conn.execute(
-            "INSERT INTO blocks (store_id, resource_id, seq, kind, text, metadata_json, location_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(store_id, resource_id, seq) DO UPDATE SET
-                 kind = excluded.kind,
-                 text = excluded.text,
-                 metadata_json = excluded.metadata_json,
-                 location_json = excluded.location_json",
-            libsql::params![
-                store.store_id(),
-                document_id,
-                block.seq as i64,
-                kind_str,
-                block.text.as_str(),
-                metadata_json.as_str(),
-                location_json.as_deref(),
-            ],
-        )
-        .await
-        .map_err(crate::connection::map_libsql_err)?;
-    }
-    Ok(())
+    let tx = store.conn().write_tx().await?;
+    let result = upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await;
+    finish_write_tx(tx, result).await
 }
 
 async fn upsert_chunks_inner(
@@ -141,17 +159,15 @@ async fn upsert_chunks_inner(
     let mut seen_resources: HashMap<(String, String), bool> = HashMap::new();
 
     for record in records {
-        // `document_id` on ChunkRecord maps to `id` (and `resource_id`) in the
-        // new schema.  `source_kind` maps to `ingestor_kind`.
-        let resource_key = (record.store_id.clone(), record.document_id.clone());
+        // `record.resource_id` maps to the `id` column on `resources`.
+        let resource_key = (record.store_id.clone(), record.resource_id.clone());
         if let std::collections::hash_map::Entry::Vacant(e) = seen_resources.entry(resource_key) {
-            // TODO(#130): record.metadata is flat parser::DocumentMetadata; should serialize as tagged Metadata enum once Resource-based reads land (#117)
             let metadata_json =
                 serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
                     message: format!("upsert_chunks metadata serialize: {e}"),
                     correlation_id: "store_handle_upsert_meta".to_string(),
                 })?;
-            let title = record.metadata.title.as_deref();
+            let title = record.metadata.title();
             conn.execute(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
                      uri, title, mime, content_hash, added_at, modified_at, origin_store,
@@ -170,9 +186,9 @@ async fn upsert_chunks_inner(
                      metadata_json  = excluded.metadata_json",
                 params![
                     record.store_id.as_str(),
-                    record.document_id.as_str(), // id column
+                    record.resource_id.as_str(), // id column
                     record.source_id.as_str(),
-                    record.source_kind.as_str(), // ingestor_kind column
+                    record.ingestor_kind.as_str(), // ingestor_kind column
                     record.uri.as_str(),
                     title,
                     record.mime.as_deref(),
@@ -198,23 +214,38 @@ async fn upsert_chunks_inner(
                 message: format!("upsert_chunks heading_path serialize: {e}"),
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
-        let location_json = serde_json::to_string(&serde_json::json!({
+        // location_json shape:
+        // `{"start": N, "end": N, "window_block_seqs": [..], "page": N}`.
+        // `window_block_seqs` is included only for message-window chunks (#129)
+        // and `page` only for paginated formats (#103); a plain chunk keeps the
+        // original `{start, end}` shape. Missing keys read back as their
+        // defaults (empty / None) — no schema/DDL change (#103).
+        let mut location_value = serde_json::json!({
             "start": record.span.start,
             "end": record.span.end,
-        }))
-        .map_err(|e| Error::Internal {
-            message: format!("upsert_chunks location_json serialize: {e}"),
-            correlation_id: "store_handle_upsert_location".to_string(),
-        })?;
+        });
+        if !record.window_block_seqs.is_empty() {
+            location_value["window_block_seqs"] = serde_json::json!(record.window_block_seqs);
+        }
+        if let Some(page) = record.page {
+            location_value["page"] = serde_json::json!(page);
+        }
+        let location_json =
+            serde_json::to_string(&location_value).map_err(|e| Error::Internal {
+                message: format!("upsert_chunks location_json serialize: {e}"),
+                correlation_id: "store_handle_upsert_location".to_string(),
+            })?;
 
-        // TODO(#128): block_id is hardcoded to 0; should reference the actual blocks.rowid
+        // The canonical block reference is `(store_id, resource_id, block_seq)` — no
+        // `block_id`/rowid foreign key (#128): rowids aren't stable across a
+        // replace, and window chunks (#129) reference a *set* of block seqs,
+        // which a single scalar FK can't express.
         let sql = format!(
-            "INSERT INTO chunks (store_id, id, resource_id, block_id, block_seq,
+            "INSERT INTO chunks (store_id, id, resource_id, block_seq,
                  seq_in_block, block_kind, text, heading_path, location_json, embedding)
-             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, {vector_sql})
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {vector_sql})
              ON CONFLICT(store_id, id) DO UPDATE SET
                  resource_id  = excluded.resource_id,
-                 block_id     = excluded.block_id,
                  block_seq    = excluded.block_seq,
                  seq_in_block = excluded.seq_in_block,
                  block_kind   = excluded.block_kind,
@@ -228,7 +259,7 @@ async fn upsert_chunks_inner(
             params![
                 record.store_id.as_str(),
                 record.id.as_str(),
-                record.document_id.as_str(), // resource_id column
+                record.resource_id.as_str(), // resource_id column
                 record.block_seq as i64,
                 record.seq_in_block as i64,
                 record.block_kind.as_deref(),
@@ -243,16 +274,29 @@ async fn upsert_chunks_inner(
     Ok(())
 }
 
-/// Atomically upsert chunks and blocks in a single transaction.
+/// Atomically upsert chunks and blocks in a single transaction, optionally
+/// replacing an existing document first.
 ///
 /// Unlike calling `upsert_chunks` and `upsert_blocks` separately (two
-/// transactions), this wraps both writes in one BEGIN/COMMIT so the resource
+/// transactions), this wraps both writes in one `write_tx` so the resource
 /// can never appear indexed (chunks present) but un-blocked.
+///
+/// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks,
+/// blocks, and resource row are deleted **inside this same transaction**,
+/// before the new records are inserted (issue #79). This closes the residual
+/// same-run window from the A6 design decision (`docs/design-decisions.md`):
+/// previously the replace delete ran in its own transaction, so a write
+/// failure in the upsert that followed left the old chunks gone for the rest
+/// of the run. Folding the delete into this transaction means a failure
+/// anywhere below (including the delete-then-reinsert of the very same
+/// `resource_id`, for a policy-only re-index) rolls back everything and
+/// leaves the old resource intact and searchable.
 pub(crate) async fn upsert_chunks_and_blocks(
     store: &TenantStore,
-    document_id: &str,
+    resource_id: &str,
     records: Vec<ChunkRecord>,
     blocks: &[localdb_core::block::Block],
+    replaces_resource_id: Option<&str>,
 ) -> Result<usize, localdb_core::Error> {
     for record in &records {
         if record.store_id != store.store_id() {
@@ -267,32 +311,34 @@ pub(crate) async fn upsert_chunks_and_blocks(
             });
         }
     }
-    let conn = store.conn().conn().await;
     let count = records.len();
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = async {
-        upsert_chunks_inner(&conn, &records, store.encoding()).await?;
-        upsert_blocks_inner(&conn, store.store_id(), document_id, blocks).await?;
-        Ok::<(), localdb_core::Error>(())
+    let tx = store.conn().write_tx().await?;
+    // Inline `async` block, not a separate closure/helper: it only borrows
+    // `&tx` (and the still-owned `store`/`records`/`resource_id`/`blocks`/
+    // `replaces_resource_id` locals) for the duration of this single
+    // `.await` right below — an ordinary borrow the compiler checks against
+    // this function's own scope, no `'static` bound or boxing required.
+    let result: Result<usize, localdb_core::Error> = async {
+        if let Some(old_id) = replaces_resource_id {
+            delete_document_inner(&tx, store.store_id(), old_id).await?;
+        }
+        upsert_chunks_inner(&tx, &records, store.encoding()).await?;
+        upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await?;
+        Ok(count)
     }
     .await;
-    match inner {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    finish_write_tx(tx, result).await
 }
 
-/// Inner (connection-level) helper for upserting blocks within an existing transaction.
+/// Inner (connection-level) helper for upserting blocks within an existing
+/// `write_tx`. The sole implementation shared by both the standalone
+/// `upsert_blocks` (its own single-purpose `write_tx`) and
+/// `upsert_chunks_and_blocks` (blocks upserted as one step of a larger
+/// transaction).
 async fn upsert_blocks_inner(
     conn: &Connection,
     store_id: &str,
-    document_id: &str,
+    resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
     for block in blocks {
@@ -316,7 +362,7 @@ async fn upsert_blocks_inner(
                  location_json = excluded.location_json",
             libsql::params![
                 store_id,
-                document_id,
+                resource_id,
                 block.seq as i64,
                 kind_str,
                 block.text.as_str(),

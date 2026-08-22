@@ -1,51 +1,48 @@
 # Quick Start
 
-This guide walks through the complete workflow: initialize, create a store, add a source, index
-files, and search — using only the CLI in embedded mode (no daemon required).
+This guide walks through the complete workflow: create a store, add a source, index files, and
+search — using only the CLI in embedded mode (no daemon required). Config is created for you
+automatically along the way; an explicit init step is optional.
 
 For installation instructions, see [install.md](install.md).
 
-## Step 1 — Initialize
+## Step 1 — Check initial status
 
-Run `init` once to write the config file and prepare the data directory:
+Confirm the installation is working:
 
 ```bash
-localdb init
+localdb status
 ```
 
-Output:
-
 ```
-Initialized localdb at ~/Library/Application Support/com.localdb.localdb.localdb
-  Config: ~/Library/Application Support/com.localdb.localdb.localdb/config.yaml
-  Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
+daemon: not running (embedded mode)
+stores (1):
+  default [libsql] 0 documents, 0 chunks
 
-Note: embedding models will be downloaded on first index.
-Run `localdb store add <name>` to create a store.
-```
-
-(Paths shown are the macOS defaults — see [configuration.md](configuration.md) for Linux
-paths and the `--config` flag. Yes, the `com.localdb.localdb.localdb` segment is verbose;
-see [architecture.md known gaps](architecture.md#known-gaps).)
-
-The generated `config.yaml` contains only the version key by default:
-
-```yaml
-version: 1
-# localdb configuration
-# Add stores and sources below.
+database: ~/Library/Application Support/localdb/data/localdb.db
+  size: 140.0 KB (+ 0 B WAL)
+  largest tables:
+    sources — 24.0 KB
+    resources — 16.0 KB
+    chunks — 16.0 KB
+    stores — 12.0 KB
+    blocks — 12.0 KB
 ```
 
-> **Note on the "embedding models will be downloaded" message:** This is accurate. The default
-> embedder (`pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first
-> time `localdb index` or `localdb search` runs. No API key or license click-through is required.
-> Subsequent runs use the cached model. See
-> [install.md#a-note-on-embedding-models](install.md#a-note-on-embedding-models).
+Running this — or any command other than `db status`/`migrate`/`downgrade`/`vacuum` — is what
+creates the config file, along with the data/models/logs directories, on first use; there's no
+separate init step required. Scaffolding also creates a `default` store, which is why it already
+shows up above. The generated `config.yaml` is a commented template with every key at its default
+value, spelled out for discoverability, not a bare stub; see
+[configuration.md#config-is-created-for-you](configuration.md#config-is-created-for-you) for the
+full generated file and the `$schema` editor-integration section. If you'd rather do this explicitly
+up front instead of implicitly on first use — e.g. to review the generated paths, or to pre-download
+the embedding model with `--download-model` — see `localdb init` in [cli.md](cli.md#localdb-init).
 
 ## Step 2 — (Optional) Override data paths
 
-By default the data directory follows your platform's standard location. To keep everything under
-a single directory (useful for development or isolation), add a `paths` block to your config:
+By default the data directory follows your platform's standard location. To keep everything under a
+single directory (useful for development or isolation), add a `paths` block to your config:
 
 ```yaml
 version: 1
@@ -58,21 +55,7 @@ paths:
 The config file path can also be set with the `LOCALDB_CONFIG` environment variable or the
 `--config <path>` flag on any command.
 
-## Step 3 — Check initial status
-
-Confirm the installation is working:
-
-```bash
-localdb status
-```
-
-```
-daemon: not running (embedded mode)
-stores (0):
-  (none)
-```
-
-## Step 4 — Create a store
+## Step 3 — Create a store
 
 A store is a named, isolated index. Create one called `notes`:
 
@@ -91,12 +74,14 @@ localdb store list
 ```
 
 ```
-notes [libsql] (runtime)
+default [libsql]
+notes [libsql]
 ```
 
-The `[libsql]` label is the storage backend.
+`default` is the store scaffolding created back in Step 1; `notes` is the one just added. The
+`[libsql]` label is the storage backend.
 
-## Step 5 — Add a source
+## Step 4 — Add a source
 
 Point the `notes` store at a directory of files. Here we use `~/notes` as the source path:
 
@@ -115,10 +100,10 @@ localdb source list --store notes
 ```
 
 ```
-01KTVH6AY4DC84HWW7M2PP4F0X [path] ~/notes
+01KTVH6AY4DC84HWW7M2PP4F0X [path] /home/user/notes
 ```
 
-## Step 6 — Index
+## Step 5 — Index
 
 Scan the source directory and write chunks to the store:
 
@@ -127,11 +112,18 @@ localdb index --store notes
 ```
 
 ```
-Indexing source 01KTVH6AY4DC84HWW7M2PP4F0X (~/notes)
-Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 errors
+Indexing /home/user/notes
+Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 unsupported, 0 errors
 ```
 
 (Output reflects a corpus of three files; your counts will differ.)
+
+> **Note on the model download:** the default embedder (`provider: local`,
+> `pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first time
+> `localdb index` or `localdb search` runs. No API key or license click-through is required.
+> Subsequent runs use the cached model. To fetch it ahead of time instead, run
+> `localdb init --download-model` (see [cli.md](cli.md#localdb-init)). See
+> [install.md#a-note-on-embedding-models](install.md#a-note-on-embedding-models) for details.
 
 After indexing, the on-disk layout under the data directory looks like:
 
@@ -142,25 +134,21 @@ data/
   localdb.db-shm        # shared-memory sidecar (libsql managed)
 ```
 
-## Step 7 — Search
+## Step 6 — Search
 
 Run a plain-text search across the indexed store:
 
 ```bash
-localdb search how does rust handle errors
+localdb search hybrid search
 ```
 
 ```
-1. file:///path/to/notes/rust-error-handling.md > Error handling in Rust
-   Error handling in Rust
-Rust uses the Result type for recoverable errors and panic! for unrecoverable ones. The question-
+1. file:///home/user/notes/lancedb-notes.md > LanceDB notes
+   LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.
 
-2. file:///path/to/notes/meeting.txt
-   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark c
+2. file:///home/user/notes/meeting.txt
+   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.
 
-3. file:///path/to/notes/lancedb-notes.md > LanceDB notes
-   LanceDB notes
-LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combi
 ```
 
 (Paths shown from a scratch run.)
@@ -168,13 +156,13 @@ LanceDB is an embedded vector database built on the Lance columnar format. It su
 Limit results with `--limit`:
 
 ```bash
-localdb search --limit 2 rank fusion
+localdb search --limit 1 rank fusion
 ```
 
 ### JSON output
 
-Pass `--json` to get machine-readable citations. The citation shape is the canonical
-`localdb` Citation object (see [../specs/02-domain-model.md](../specs/02-domain-model.md) §6):
+Pass `--json` to get machine-readable citations. The citation shape is the canonical `localdb`
+Citation object (see [../specs/02-domain-model.md](../specs/02-domain-model.md) §6):
 
 ```bash
 localdb search -s notes --json hybrid search
@@ -184,44 +172,75 @@ localdb search -s notes --json hybrid search
 {
   "citations": [
     {
-      "chunk_id": "f0113639ebf62fa402aa506a80e0f6dba19a970cfbea3c80ffbb4ca082db30e7",
-      "document_id": "ff6ff626d0062eab2d3a5f76dbbe75e6a265a127d99486cacfcde9f42777fe1d",
-      "heading_path": [
-        "LanceDB notes"
-      ],
+      "block": {
+        "kind": "text",
+        "seq": 1
+      },
+      "chunk_id": "82b4631e898166f7834a786b1e8e56125ce6bfc2193fc210f591179527abbdcb",
+      "chunk_position": {
+        "seq_in_block": 0
+      },
+      "heading_path": ["LanceDB notes"],
+      "location": {
+        "span": {
+          "end": 157,
+          "start": 0
+        }
+      },
+      "metadata": {
+        "contributor": [],
+        "coverage": null,
+        "creator": [],
+        "date": null,
+        "description": null,
+        "format": "text/markdown",
+        "identifier": null,
+        "kind": "document",
+        "language": null,
+        "page_count": null,
+        "publisher": null,
+        "relation": [],
+        "rights": null,
+        "source": null,
+        "subject": [],
+        "title": "LanceDB notes",
+        "type": null,
+        "word_count": null
+      },
       "provenance": {
-        "content_hash": "360be062b82116aa1a7f707bc9ea9d2f60e0f619e84e4f0f72e8f689d0e18f64",
+        "content_hash": "55567825f371ea048f61a59fa156068945a7ef0d9276b7813438820002ce72a2",
         "fetched_at": "2026-06-11T14:17:30Z"
       },
+      "resource_id": "ee2cfd35725ead3b0fb7ebccdcc4cf9fa0ea6990ac2fa1276dc689e1abed6700",
       "score": {
         "bm25": 1.9203118085861206,
-        "dense": 0.64,
+        "dense": 0.640625,
         "fused": 0.032266458495966696
       },
-      "snippet": "LanceDB notes\nLanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.\n",
-      "span": {
-        "end": 172,
-        "start": 0
-      },
+      "snippet": "LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.",
       "store": {
         "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
         "name": "notes"
       },
       "title": "LanceDB notes",
-      "uri": "file:///private/tmp/localdb-recon.0z2dTw/notes/lancedb-notes.md"
+      "uri": "file:///home/user/notes/lancedb-notes.md"
     }
   ]
 }
 ```
 
+(The structural fields above — `block`, `chunk_position`, `heading_path`, `location.span`,
+`snippet`, `metadata`, `chunk_id`, `resource_id` and `provenance.content_hash` — are captured from a
+real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative.)
+
 (Output truncated to one result; paths shown from a scratch run.)
 
-**Score fields:** `bm25` is the BM25 full-text score; `dense` is the normalized Hamming
-similarity (`1.0 − hamming_dist / nbits`) from the binary-quantized local ONNX embedder
-(`pplx-embed-context-v1-0.6b` by default). `fused` is the Reciprocal Rank Fusion score
-used for final ranking, combining both components.
+**Score fields:** `bm25` is the BM25 full-text score; `dense` is the normalized Hamming similarity
+(`1.0 − hamming_dist / nbits`) from the binary-quantized local ONNX embedder
+(`pplx-embed-context-v1-0.6b` by default). `fused` is the Reciprocal Rank Fusion score used for
+final ranking, combining both components.
 
-## Step 8 — Verify status after indexing
+## Step 7 — Verify status after indexing
 
 ```bash
 localdb status
@@ -230,7 +249,7 @@ localdb status
 ```
 daemon: not running (embedded mode)
 stores (1):
-  notes [libsql] (runtime)
+  notes [libsql]
 ```
 
 ## What's next
@@ -238,6 +257,5 @@ stores (1):
 - **Configuration reference:** [configuration.md](configuration.md) — full YAML schema, path
   overrides, per-store indexing policy.
 - **CLI reference:** [cli.md](cli.md) — all commands, flags, exit codes, and JSON shapes.
-- **MCP integration:** [mcp.md](mcp.md) — connecting localdb to AI agents via the MCP stdio
-  server.
+- **MCP integration:** [mcp.md](mcp.md) — connecting localdb to AI agents via the MCP stdio server.
 - **Architecture and design:** [../specs/01-architecture.md](../specs/01-architecture.md)

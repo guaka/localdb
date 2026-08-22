@@ -17,20 +17,26 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
     let state = AppState::new(
         fake_yaml_config(),
         dir.path().to_path_buf(),
+        dir.path().join("models"),
         queue.clone(),
         UrlRefreshScheduler::new(queue),
     )
     .await
     .expect("fake daemon state should open a temp libsql database");
 
-    (dir, build_router(state))
+    (
+        dir,
+        build_router(
+            state,
+            vec![],
+            std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+            vec![],
+        ),
+    )
 }
 
 fn fake_yaml_config() -> RawConfig {
     RawConfig {
-        version: 1,
-        server: Default::default(),
-        paths: Default::default(),
         defaults: DefaultsConfig {
             indexing: IndexingPolicyConfig {
                 chunking: Default::default(),
@@ -41,7 +47,7 @@ fn fake_yaml_config() -> RawConfig {
                 ..Default::default()
             },
         },
-        providers: vec![],
+        ..Default::default()
     }
 }
 

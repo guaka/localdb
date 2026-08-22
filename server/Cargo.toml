@@ -1,17 +1,44 @@
 [package]
-name = "server"
+name = "localdb-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "HTTP API daemon: axum REST API, file watching, job queue, unix socket"
 
+[lib]
+# Keep the short crate name in code (`use server::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "server"
+
 [dependencies]
-localdb-core = { path = "../core" }
-store-libsql = { path = "../store-libsql" }
-embed = { path = "../embed" }
+localdb-core = { path = "../core", version = "0.1.0" }
+localdb-store-libsql = { path = "../store-libsql", version = "0.1.0" }
+localdb-embed = { path = "../embed", version = "0.1.0" }
+localdb-extract = { path = "../extract", version = "0.1.0" }
+localdb-fetch = { path = "../fetch", version = "0.1.0" }
+localdb-ingest = { path = "../ingest", version = "0.1.0" }
+localdb-mcp = { path = "../mcp", version = "0.1.0" }
+async-trait = { workspace = true }
 axum = { workspace = true }
+# `axum_extra::extract::Query` (issue #187 review, finding F7): unlike
+# `axum::extract::Query`, it deserializes repeated query keys into a
+# `Vec<T>` field via `serde_html_form` — needed for `GET /status`'s
+# repeatable `?store=` scoping param (`server/src/handlers/status.rs`),
+# mirroring the CLI's repeatable `--store` flag.
+axum-extra = { version = "0.12", default-features = false, features = ["query"] }
+# `futures::stream::unfold` builds the `GET /v1/jobs/{id}/events` SSE stream
+# (issue #83) — `axum::response::sse::Sse` requires its payload to implement
+# `futures_util::stream::Stream`, which `futures` re-exports. Already a
+# pinned workspace dependency (`futures = "0.3"` in the root `Cargo.toml`,
+# already resolved in `Cargo.lock` as a transitive dependency of `axum`
+# itself) — this only newly *directly* depends on it for `server`, it does
+# not add a new crate to the dependency graph.
+futures = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,4 +54,12 @@ serde_yaml = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-reqwest = { version = "0.12", features = ["json"], default-features = false }
+tracing-subscriber = { workspace = true }
+
+# Client-side transport for the `/mcp` route's round-trip integration test
+# (server/tests/mcp_route.rs) — not used by any non-test code, which only
+# ever gets a concrete tower::Service back from `mcp::build_streamable_http_service`.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }

@@ -12,7 +12,7 @@
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, BlockLocation};
 use crate::ids::content_hash;
 
 // ---------------------------------------------------------------------------
@@ -31,8 +31,39 @@ use crate::ids::content_hash;
 /// `ENABLE_TABLES` and `ENABLE_STRIKETHROUGH` options. Blocks are assigned
 /// sequential `seq` values starting from 0. `location` is always `None`.
 pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
+    markdown_to_blocks_with_pages(markdown, &[])
+}
+
+/// Like [`markdown_to_blocks`], but stamps each block's `location.page` by
+/// resolving the block's first contributing source byte against `page_starts`
+/// — `(byte_offset, 1-based page number)` pairs, ascending in both fields, as
+/// produced by PDF extraction (`ParsedDocument::page_starts`).
+///
+/// **Page attribution rule** (specs/02-domain-model.md §6): a block's page is
+/// the page containing its *first contributing byte*. Blocks are never split
+/// at page boundaries — a coarse `Text` run crossing a page break carries the
+/// page it starts on.
+///
+/// With an empty `page_starts` this is behavior-identical to
+/// [`markdown_to_blocks`]: every block's `location` stays `None`.
+pub fn markdown_to_blocks_with_pages(markdown: &str, page_starts: &[(usize, u32)]) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut seq: u32 = 0;
+
+    // Resolve a byte offset (into `markdown`) to a location carrying the page
+    // that starts at or before it. Offsets before the first entry (possible
+    // when page 1 contributed no content) attribute to the first listed page.
+    let page_at = |offset: usize| -> Option<BlockLocation> {
+        if page_starts.is_empty() {
+            return None;
+        }
+        let idx = page_starts.partition_point(|&(start, _)| start <= offset);
+        let page = page_starts[idx.saturating_sub(1)].1;
+        Some(BlockLocation {
+            page: Some(page),
+            ..Default::default()
+        })
+    };
 
     // -----------------------------------------------------------------------
     // 1. Pre-scan: YAML front-matter detection
@@ -45,7 +76,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 format: "yaml".to_string(),
             },
             text: fm_text,
-            location: None,
+            location: page_at(0),
         });
         seq += 1;
     }
@@ -58,7 +89,12 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_DEFINITION_LIST;
 
-    let parser = Parser::new_ext(rest, opts);
+    // `rest` is always a suffix of `markdown` (possibly all of it, possibly
+    // empty), so event ranges — relative to `rest` — map into `markdown`
+    // coordinates by adding the suffix's start offset.
+    let rest_base = markdown.len() - rest.len();
+
+    let parser = Parser::new_ext(rest, opts).into_offset_iter();
 
     // We accumulate block state using a simple stack-based approach.  The
     // pulldown-cmark stream is a flat sequence of `Start`/`End` events with
@@ -68,12 +104,34 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
     // Active block being assembled.
     struct ActiveBlock {
         kind: ActiveKind,
+        /// Byte offset (into `markdown`) of the element's `Start` event —
+        /// the block's first contributing byte, for page attribution.
+        start: usize,
         /// Accumulated text pieces.
         text: Vec<String>,
         /// Table-specific state.
         table_headers: Vec<String>,
+        table_rows: Vec<Vec<String>>,
+        table_row: Vec<String>,
+        table_cell: Vec<String>,
         table_row_count: usize,
         in_table_head: bool,
+    }
+
+    impl ActiveBlock {
+        fn new(kind: ActiveKind, start: usize) -> Self {
+            ActiveBlock {
+                kind,
+                start,
+                text: Vec::new(),
+                table_headers: Vec::new(),
+                table_rows: Vec::new(),
+                table_row: Vec::new(),
+                table_cell: Vec::new(),
+                table_row_count: 0,
+                in_table_head: false,
+            }
+        }
     }
 
     enum ActiveKind {
@@ -81,53 +139,87 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         Paragraph,
         Code { language: Option<String> },
         Quote,
-        List { ordered: bool },
+        List,
         Table,
         Image { src: Option<String> },
     }
 
     let mut stack: Vec<ActiveBlock> = Vec::new();
 
-    // Helper: push a completed block.
+    // Running-text accumulator: holds the finished text of each consecutive
+    // running-text element (paragraph, list, blockquote, HTML block). Flushed
+    // into a single `BlockKind::Text` block at structural boundaries (heading,
+    // code, table, image) and once more after the event loop.
+    let mut text_accum: Vec<String> = Vec::new();
+    // Earliest source offset among the accumulator's contributors — the
+    // eventual `Text` block's first contributing byte.
+    let mut accum_start: Option<usize> = None;
+
+    // Helper: push a completed block at the given source offset.
     macro_rules! push_block {
-        ($blocks:expr, $seq:expr, $kind:expr, $text:expr) => {{
+        ($blocks:expr, $seq:expr, $kind:expr, $text:expr, $start:expr) => {{
             let text = $text;
             if !text.is_empty() {
                 $blocks.push(Block {
                     seq: $seq,
                     kind: $kind,
                     text,
-                    location: None,
+                    location: page_at($start),
                 });
                 $seq += 1;
             }
         }};
     }
 
-    for event in parser {
+    // Helper: append finished element text to the running-text accumulator,
+    // tracking the earliest contributing offset.
+    macro_rules! accum_push {
+        ($text:expr, $start:expr) => {{
+            let text = $text;
+            if !text.is_empty() {
+                let start: usize = $start;
+                accum_start = Some(accum_start.map_or(start, |s| s.min(start)));
+                text_accum.push(text);
+            }
+        }};
+    }
+
+    // Helper: flush the running-text accumulator into a single `Text` block.
+    macro_rules! flush_text {
+        ($blocks:expr, $seq:expr, $accum:expr) => {{
+            if !$accum.is_empty() {
+                let text = $accum.join("\n\n");
+                let location = accum_start.and_then(page_at);
+                $blocks.push(Block {
+                    seq: $seq,
+                    kind: BlockKind::Text,
+                    text,
+                    location,
+                });
+                $seq += 1;
+                $accum.clear();
+            }
+            accum_start = None;
+        }};
+    }
+
+    for (event, range) in parser {
+        // The element's first byte in `markdown` coordinates. For `Start`
+        // events the range covers the whole element, so `range.start` is the
+        // element's first contributing byte.
+        let offset = rest_base + range.start;
         match event {
             // ----------------------------------------------------------------
             // Block start events
             // ----------------------------------------------------------------
             Event::Start(Tag::Heading { level, .. }) => {
+                flush_text!(blocks, seq, text_accum);
                 let lv = level as u8;
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Heading { level: lv },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Heading { level: lv }, offset));
             }
 
             Event::Start(Tag::Paragraph) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Paragraph,
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Paragraph, offset));
             }
 
             Event::Start(Tag::CodeBlock(fence)) => {
@@ -142,45 +234,24 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                     }
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Code { language: lang },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                flush_text!(blocks, seq, text_accum);
+                stack.push(ActiveBlock::new(
+                    ActiveKind::Code { language: lang },
+                    offset,
+                ));
             }
 
             Event::Start(Tag::BlockQuote(_)) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Quote,
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Quote, offset));
             }
 
-            Event::Start(Tag::List(start)) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::List {
-                        ordered: start.is_some(),
-                    },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+            Event::Start(Tag::List(_start)) => {
+                stack.push(ActiveBlock::new(ActiveKind::List, offset));
             }
 
             Event::Start(Tag::Table(_alignments)) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Table,
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                flush_text!(blocks, seq, text_accum);
+                stack.push(ActiveBlock::new(ActiveKind::Table, offset));
             }
 
             Event::Start(Tag::TableHead) => {
@@ -197,13 +268,8 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 // image title attribute (not the alt). We store src from dest_url.
                 // The title attribute is stored separately if present.
                 let _ = title; // may use in future
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Image { src },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                flush_text!(blocks, seq, text_accum);
+                stack.push(ActiveBlock::new(ActiveKind::Image { src }, offset));
             }
 
             // ----------------------------------------------------------------
@@ -216,7 +282,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         ActiveKind::Heading { level } => level,
                         _ => 1,
                     };
-                    push_block!(blocks, seq, BlockKind::Heading { level }, text);
+                    push_block!(blocks, seq, BlockKind::Heading { level }, text, b.start);
                 }
             }
 
@@ -229,7 +295,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                             // propagate the text up rather than emitting a new block.
                             if let Some(parent) = stack.last_mut() {
                                 match parent.kind {
-                                    ActiveKind::Quote | ActiveKind::List { .. } => {
+                                    ActiveKind::Quote | ActiveKind::List => {
                                         if !parent.text.is_empty() {
                                             parent.text.push(" ".to_string());
                                         }
@@ -240,18 +306,13 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                                     _ => {}
                                 }
                             }
-                            // Top-level paragraph: emit it.
-                            push_block!(blocks, seq, BlockKind::Paragraph, text);
+                            // Top-level paragraph: feed the running-text accumulator
+                            // rather than emitting a standalone block.
+                            accum_push!(text, b.start);
                         }
                         _ => {
                             // Restore — shouldn't happen normally.
-                            stack.push(ActiveBlock {
-                                kind: b.kind,
-                                text: b.text,
-                                table_headers: b.table_headers,
-                                table_row_count: b.table_row_count,
-                                in_table_head: b.in_table_head,
-                            });
+                            stack.push(b);
                         }
                     }
                 }
@@ -264,25 +325,21 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         ActiveKind::Code { language } => language,
                         _ => None,
                     };
-                    push_block!(blocks, seq, BlockKind::Code { language }, text);
+                    push_block!(blocks, seq, BlockKind::Code { language }, text, b.start);
                 }
             }
 
             Event::End(TagEnd::BlockQuote(_)) => {
                 if let Some(b) = stack.pop() {
                     let text = b.text.join(" ");
-                    push_block!(blocks, seq, BlockKind::Quote, text);
+                    accum_push!(text, b.start);
                 }
             }
 
             Event::End(TagEnd::List(_)) => {
                 if let Some(b) = stack.pop() {
-                    let ordered = match b.kind {
-                        ActiveKind::List { ordered } => ordered,
-                        _ => false,
-                    };
                     let text = b.text.join("\n");
-                    push_block!(blocks, seq, BlockKind::List { ordered }, text);
+                    accum_push!(text, b.start);
                 }
             }
 
@@ -290,8 +347,49 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 if let Some(b) = stack.pop() {
                     let headers = b.table_headers.clone();
                     let rows = b.table_row_count;
-                    let text = b.text.join(" ");
-                    push_block!(blocks, seq, BlockKind::Table { headers, rows }, text);
+                    // Reconstruct pipe-syntax Markdown so downstream consumers
+                    // (chunk_table) can re-split the table row-by-row. Cell text
+                    // containing `|` is re-escaped to keep each line parseable.
+                    let esc = |s: &String| s.replace('|', "\\|");
+                    let ncols = b
+                        .table_headers
+                        .len()
+                        .max(b.table_rows.iter().map(Vec::len).max().unwrap_or(0));
+                    let text = if ncols == 0 {
+                        String::new()
+                    } else {
+                        let render_row = |cells: &[String]| {
+                            let padded: Vec<String> = (0..ncols)
+                                .map(|i| cells.get(i).map(esc).unwrap_or_default())
+                                .collect();
+                            format!("| {} |", padded.join(" | "))
+                        };
+                        let mut lines = vec![
+                            render_row(&b.table_headers),
+                            format!("|{}|", vec![" --- "; ncols].join("|")),
+                        ];
+                        lines.extend(b.table_rows.iter().map(|r| render_row(r)));
+                        lines.join("\n")
+                    };
+                    push_block!(
+                        blocks,
+                        seq,
+                        BlockKind::Table { headers, rows },
+                        text,
+                        b.start
+                    );
+                }
+            }
+
+            Event::End(TagEnd::TableCell) => {
+                if let Some(b) = stack.last_mut() {
+                    let cell = b.table_cell.join("").trim().to_string();
+                    b.table_cell.clear();
+                    if b.in_table_head {
+                        b.table_headers.push(cell);
+                    } else {
+                        b.table_row.push(cell);
+                    }
                 }
             }
 
@@ -305,6 +403,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 if let Some(b) = stack.last_mut() {
                     if !b.in_table_head {
                         b.table_row_count += 1;
+                        b.table_rows.push(std::mem::take(&mut b.table_row));
                     }
                 }
             }
@@ -328,7 +427,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         seq,
                         kind: BlockKind::Image { alt, src },
                         text,
-                        location: None,
+                        location: page_at(b.start),
                     });
                     seq += 1;
                 }
@@ -340,28 +439,30 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             Event::Text(t) => {
                 if let Some(b) = stack.last_mut() {
                     match &b.kind {
-                        ActiveKind::Table => {
-                            if b.in_table_head {
-                                b.table_headers.push(t.to_string());
-                            } else {
-                                b.text.push(t.to_string());
-                            }
-                        }
+                        // Table text accumulates per cell; TagEnd::TableCell
+                        // routes the finished cell to headers or the open row.
+                        ActiveKind::Table => b.table_cell.push(t.to_string()),
                         _ => b.text.push(t.to_string()),
                     }
                 }
             }
 
             Event::Code(t) => {
-                // Inline code inside a paragraph/heading.
+                // Inline code inside a paragraph/heading/table cell.
                 if let Some(b) = stack.last_mut() {
-                    b.text.push(t.to_string());
+                    match &b.kind {
+                        ActiveKind::Table => b.table_cell.push(t.to_string()),
+                        _ => b.text.push(t.to_string()),
+                    }
                 }
             }
 
             Event::SoftBreak | Event::HardBreak => {
                 if let Some(b) = stack.last_mut() {
-                    b.text.push(" ".to_string());
+                    match &b.kind {
+                        ActiveKind::Table => b.table_cell.push(" ".to_string()),
+                        _ => b.text.push(" ".to_string()),
+                    }
                 }
             }
 
@@ -371,30 +472,23 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             Event::Start(Tag::Item) => {
                 // Add separator before each item except the first.
                 if let Some(b) = stack.last_mut() {
-                    if matches!(b.kind, ActiveKind::List { .. }) && !b.text.is_empty() {
+                    if matches!(b.kind, ActiveKind::List) && !b.text.is_empty() {
                         b.text.push("\n".to_string());
                     }
                 }
             }
 
             Event::Html(t) => {
-                // Flush any open block before emitting an HTML block.
-                // HTML blocks are stand-alone: they do not nest inside a
-                // paragraph or other container.
+                // HTML blocks are running text: drain any open stack blocks'
+                // text into the accumulator, then append this HTML fragment.
+                // Do NOT flush — HTML merges with surrounding paragraphs into
+                // the same `Text` block.
                 while let Some(b) = stack.pop() {
                     let text = b.text.join(" ");
-                    push_block!(blocks, seq, BlockKind::Paragraph, text);
+                    accum_push!(text, b.start);
                 }
                 let trimmed = t.trim().to_string();
-                if !trimmed.is_empty() {
-                    blocks.push(Block {
-                        seq,
-                        kind: BlockKind::Paragraph,
-                        text: trimmed,
-                        location: None,
-                    });
-                    seq += 1;
-                }
+                accum_push!(trimmed, offset);
             }
 
             // Ignore everything else: HR, footnotes, soft/hard breaks, and
@@ -405,6 +499,12 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         }
     }
 
+    // Flush any trailing running text after the event loop ends.
+    flush_text!(blocks, seq, text_accum);
+    // Final flush_text! increments seq and resets accum_start; neither is
+    // read again after the loop.
+    let _ = (seq, accum_start);
+
     blocks
 }
 
@@ -412,16 +512,30 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
 // compute_blocks_hash
 // ---------------------------------------------------------------------------
 
-/// Compute a content hash from block kind and text, joined with separators.
+/// Compute a content hash from block kind, text, and page, joined with separators.
 ///
 /// Each block contributes `"kind:text"` and entries are separated by `\x00`
 /// (NUL byte) to prevent cross-block collisions. Including the block kind
 /// ensures that structural changes (e.g. paragraph→heading with same text)
 /// trigger re-indexing.
+///
+/// When a block carries a page number (paginated formats — PDF, #103) it is
+/// folded in as a `\x01p{page}` suffix, so a **repagination that leaves the
+/// text and kinds unchanged still changes the hash** and re-indexes — otherwise
+/// the skip-check (which keys on this hash) would leave stored citations on
+/// their old, now-wrong pages. Blocks without a page (every non-paginated
+/// format) contribute no suffix, so their hashes are unchanged from before this
+/// addition — no spurious global reindex.
 pub fn compute_blocks_hash(blocks: &[Block]) -> String {
     let combined: String = blocks
         .iter()
-        .map(|b| format!("{}:{}", b.kind.kind_str(), b.text))
+        .map(|b| {
+            let base = format!("{}:{}", b.kind.kind_str(), b.text);
+            match b.location.as_ref().and_then(|loc| loc.page) {
+                Some(page) => format!("{base}\x01p{page}"),
+                None => base,
+            }
+        })
         .collect::<Vec<_>>()
         .join("\x00");
     content_hash(&combined)
@@ -540,9 +654,10 @@ fn main() {}
 ";
 
         let blocks = markdown_to_blocks(md);
-        assert!(
-            blocks.len() >= 5,
-            "expected at least 5 blocks, got {}: {:?}",
+        assert_eq!(
+            blocks.len(),
+            6,
+            "expected 6 blocks (h1, text, h2, text, code, text), got {}: {:?}",
             blocks.len(),
             blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
         );
@@ -566,7 +681,7 @@ fn main() {}
         assert!(h2.is_some(), "expected an h2 heading");
         assert_eq!(h2.unwrap().text, "Setup");
 
-        // Find a code block.
+        // Find a code block — Code still breaks the run into its own block.
         let code = blocks
             .iter()
             .find(|b| matches!(&b.kind, BlockKind::Code { .. }));
@@ -576,16 +691,33 @@ fn main() {}
             assert_eq!(language.as_deref(), Some("rust"));
         }
 
-        // Find a list block.
-        let list = blocks
+        // The list and blockquote fold into the same Text block: no
+        // heading/code/table sits between them.
+        let list_text = blocks
             .iter()
-            .find(|b| matches!(&b.kind, BlockKind::List { .. }));
-        assert!(list.is_some(), "expected a list block");
-        assert!(list.unwrap().text.contains("Item one"));
+            .find(|b| b.kind == BlockKind::Text && b.text.contains("Item one"));
+        assert!(
+            list_text.is_some(),
+            "expected a Text block containing the list"
+        );
+        assert!(
+            list_text.unwrap().text.contains("A blockquote here."),
+            "list and blockquote should fold into the same Text block: {:?}",
+            list_text.unwrap().text
+        );
 
-        // Find a quote block.
-        let quote = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Quote));
-        assert!(quote.is_some(), "expected a blockquote");
+        // Headings and Code still break runs: exactly 3 Text blocks total
+        // (para before h2, para before code, list+quote at the end).
+        let text_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Text)
+            .collect();
+        assert_eq!(
+            text_blocks.len(),
+            3,
+            "expected 3 Text blocks: {:?}",
+            text_blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
     }
 
     /// Verify heading_path_from_blocks output.
@@ -597,11 +729,11 @@ fn main() {}
         // Block at seq 0 is the h1 "Top"
         assert_eq!(heading_path_from_blocks(&blocks, 0), Vec::<String>::new());
 
-        // Paragraph after "# Top" — seq 1 (h1), seq 2 (paragraph)
+        // Paragraph after "# Top" — seq 1 (h1), seq 2 (text block)
         // path should be ["Top"]
         let para_seq = blocks
             .iter()
-            .find(|b| b.kind == BlockKind::Paragraph)
+            .find(|b| b.kind == BlockKind::Text)
             .map(|b| b.seq)
             .unwrap();
         let path = heading_path_from_blocks(&blocks, para_seq);
@@ -615,7 +747,7 @@ fn main() {}
         let deep_text_seq = blocks
             .iter()
             .rev()
-            .find(|b| b.kind == BlockKind::Paragraph)
+            .find(|b| b.kind == BlockKind::Text)
             .map(|b| b.seq)
             .unwrap();
         let deep_path = heading_path_from_blocks(&blocks, deep_text_seq);
@@ -629,19 +761,19 @@ fn main() {}
     fn heading_path_resets_on_new_parent() {
         let md = "# A\n\n## A1\n\n# B\n\nContent.\n";
         let blocks = markdown_to_blocks(md);
-        // After "# B", a paragraph's path should be ["B"], not ["A", "A1"] or ["B", "A1"].
+        // After "# B", a text block's path should be ["B"], not ["A", "A1"] or ["B", "A1"].
         let content_seq = blocks
             .iter()
-            .find(|b| b.kind == BlockKind::Paragraph)
+            .find(|b| b.kind == BlockKind::Text)
             .map(|b| b.seq)
             .unwrap();
         let _path = heading_path_from_blocks(&blocks, content_seq);
         // Content is after "# B" so path = ["B"]
         // Actually content might come before "# B" — verify.
-        // All paragraphs:
+        // All text blocks:
         let paras: Vec<_> = blocks
             .iter()
-            .filter(|b| b.kind == BlockKind::Paragraph)
+            .filter(|b| b.kind == BlockKind::Text)
             .collect();
         let last_para = paras.last().unwrap();
         let path = heading_path_from_blocks(&blocks, last_para.seq);
@@ -650,6 +782,123 @@ fn main() {}
             vec!["B".to_string()],
             "after # B, path must be just [B]; got {:?}",
             path
+        );
+    }
+
+    /// Consecutive paragraphs, a list, and a blockquote with no intervening
+    /// heading/code/table fold into exactly ONE `Text` block.
+    #[test]
+    fn consecutive_running_text_folds_into_one_text_block() {
+        let md = "\
+Para one.
+
+Para two.
+
+Para three.
+
+- List item
+
+> Quote line
+";
+        let blocks = markdown_to_blocks(md);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected a single Text block, got {}: {:?}",
+            blocks.len(),
+            blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(blocks[0].kind, BlockKind::Text);
+        let text = &blocks[0].text;
+        assert!(text.contains("Para one."), "missing para one: {text}");
+        assert!(text.contains("Para two."), "missing para two: {text}");
+        assert!(text.contains("Para three."), "missing para three: {text}");
+        assert!(text.contains("List item"), "missing list item: {text}");
+        assert!(text.contains("Quote line"), "missing quote line: {text}");
+        assert!(
+            text.contains("\n\n"),
+            "expected \\n\\n separators between folded elements: {text}"
+        );
+    }
+
+    /// A heading between two paragraphs breaks the run: each paragraph lands
+    /// in its own `Text` block, with the heading block in between.
+    #[test]
+    fn heading_breaks_text_run_into_separate_blocks() {
+        let md = "# H\n\npara1\n\n## H2\n\npara2\n";
+        let blocks = markdown_to_blocks(md);
+        assert_eq!(
+            blocks.len(),
+            4,
+            "expected h1, text(para1), h2, text(para2); got {}: {:?}",
+            blocks.len(),
+            blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
+        );
+        assert!(matches!(blocks[0].kind, BlockKind::Heading { level: 1 }));
+        assert_eq!(blocks[1].kind, BlockKind::Text);
+        assert_eq!(blocks[1].text, "para1");
+        assert!(matches!(blocks[2].kind, BlockKind::Heading { level: 2 }));
+        assert_eq!(blocks[3].kind, BlockKind::Text);
+        assert_eq!(blocks[3].text, "para2");
+
+        // The two Text blocks are distinct — the heading sits between them.
+        assert_ne!(blocks[1].text, blocks[3].text);
+        assert!(blocks[0].seq < blocks[1].seq);
+        assert!(blocks[1].seq < blocks[2].seq);
+        assert!(blocks[2].seq < blocks[3].seq);
+    }
+
+    /// A fenced code block between two paragraphs breaks the run: Text, Code, Text.
+    #[test]
+    fn code_block_breaks_text_run_into_separate_blocks() {
+        let md = "para1\n\n```\ncode\n```\n\npara2\n";
+        let blocks = markdown_to_blocks(md);
+        let kinds: Vec<&str> = blocks.iter().map(|b| b.kind.kind_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["text", "code", "text"],
+            "expected Text, Code, Text; got {:?}",
+            kinds
+        );
+        assert_eq!(blocks[0].text, "para1");
+        assert_eq!(blocks[2].text, "para2");
+    }
+
+    /// heading_path resolves correctly for text blocks after multiple
+    /// headings, even though each intervening run is now a single coarse
+    /// `Text` block rather than one block per paragraph.
+    #[test]
+    fn heading_path_resolves_across_coarse_text_blocks() {
+        let md = "# A\n\nIntro under A.\n\n## B\n\nText under B.\n\n### C\n\nText under C.\n";
+        let blocks = markdown_to_blocks(md);
+
+        let text_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Text)
+            .collect();
+        assert_eq!(
+            text_blocks.len(),
+            3,
+            "expected 3 Text blocks: {:?}",
+            text_blocks
+        );
+
+        let intro = blocks.iter().find(|b| b.text == "Intro under A.").unwrap();
+        assert_eq!(
+            heading_path_from_blocks(&blocks, intro.seq),
+            vec!["A".to_string()]
+        );
+
+        let under_b = blocks.iter().find(|b| b.text == "Text under B.").unwrap();
+        assert_eq!(
+            heading_path_from_blocks(&blocks, under_b.seq),
+            vec!["A".to_string(), "B".to_string()]
+        );
+
+        let under_c = blocks.iter().find(|b| b.text == "Text under C.").unwrap();
+        assert_eq!(
+            heading_path_from_blocks(&blocks, under_c.seq),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
         );
     }
 
@@ -702,6 +951,37 @@ fn main() {}
             assert_eq!(headers, &vec!["A".to_string(), "B".to_string()]);
             assert_eq!(*rows, 2, "expected 2 data rows");
         }
+        assert_eq!(
+            table_b.text, "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |",
+            "table text must be reconstructed pipe-syntax Markdown"
+        );
+    }
+
+    /// Table block text is valid pipe syntax: header line, separator line, one
+    /// line per data row — even with inline formatting and escaped pipes in
+    /// cells. This is the contract chunk_table's row splitter relies on.
+    #[test]
+    fn table_block_text_is_reparseable_markdown() {
+        let md = "| Name | Notes |\n|---|---|\n| `a\\|b` | uses *pipes* |\n| c | d |\n";
+        let blocks = markdown_to_blocks(md);
+        let table_b = blocks
+            .iter()
+            .find(|b| matches!(&b.kind, BlockKind::Table { .. }))
+            .expect("expected a table block");
+        let lines: Vec<&str> = table_b.text.lines().collect();
+        assert_eq!(lines.len(), 4, "header + separator + 2 rows: {lines:?}");
+        assert!(lines[0].starts_with('|') && lines[0].ends_with('|'));
+        assert_eq!(lines[1], "| --- | --- |");
+        assert!(
+            lines[2].contains("a\\|b"),
+            "pipe inside a cell must be re-escaped: {}",
+            lines[2]
+        );
+        // Every line has the same unescaped-pipe cell count.
+        for line in &lines {
+            let cells = line.replace("\\|", "\u{0}").matches('|').count();
+            assert_eq!(cells, 3, "expected 2 cells per line: {line}");
+        }
     }
 
     /// Empty markdown produces no blocks.
@@ -745,7 +1025,171 @@ fn main() {}
         let blocks = markdown_to_blocks(md);
         let has_html = blocks.iter().any(|b| b.text.contains("raw HTML content"));
         assert!(has_html, "HTML block must not be silently dropped");
-        assert!(blocks.len() >= 3);
+        // The heading stays discrete; the HTML block merges with the
+        // following paragraph into a single running-text Text block since
+        // nothing structural separates them.
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected heading + one merged Text block, got {}: {:?}",
+            blocks.len(),
+            blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
+        );
+        assert!(matches!(blocks[0].kind, BlockKind::Heading { level: 1 }));
+        assert_eq!(blocks[1].kind, BlockKind::Text);
+        assert!(blocks[1].text.contains("After paragraph."));
+    }
+
+    // -----------------------------------------------------------------------
+    // Page stamping (#103)
+    // -----------------------------------------------------------------------
+
+    /// With empty `page_starts`, the `_with_pages` variant is byte-identical to
+    /// `markdown_to_blocks` — the zero-page regression guard.
+    #[test]
+    fn with_pages_empty_equals_markdown_to_blocks() {
+        let samples = [
+            "# H1\n\npara1\n\n## H2\n\npara2\n",
+            "---\ntitle: x\n---\n\n# C\n\ntext\n",
+            "| A | B |\n|---|---|\n| 1 | 2 |\n",
+            "para\n\n```rust\nfn f(){}\n```\n\nmore\n",
+            "",
+        ];
+        for md in samples {
+            assert_eq!(
+                markdown_to_blocks_with_pages(md, &[]),
+                markdown_to_blocks(md),
+                "empty page_starts must match plain markdown_to_blocks for {md:?}"
+            );
+        }
+    }
+
+    /// Every block gets stamped with the page containing its first byte.
+    #[test]
+    fn blocks_stamped_with_correct_page() {
+        // "# One\n\nAlpha body.\n\n"  -> offsets 0..20
+        // "# Two\n\nBravo body.\n\n"  starts at 20
+        // "# Three\n\nCharlie body.\n" starts at 40
+        let md = "# One\n\nAlpha body.\n\n# Two\n\nBravo body.\n\n# Three\n\nCharlie body.\n";
+        let p2 = md.find("# Two").unwrap();
+        let p3 = md.find("# Three").unwrap();
+        let page_starts = vec![(0usize, 1u32), (p2, 2u32), (p3, 3u32)];
+
+        let blocks = markdown_to_blocks_with_pages(md, &page_starts);
+        let page_of = |needle: &str| {
+            blocks
+                .iter()
+                .find(|b| b.text.contains(needle))
+                .and_then(|b| b.location.as_ref())
+                .and_then(|l| l.page)
+        };
+        assert_eq!(page_of("One"), Some(1));
+        assert_eq!(page_of("Alpha body."), Some(1));
+        assert_eq!(page_of("Two"), Some(2));
+        assert_eq!(page_of("Bravo body."), Some(2));
+        assert_eq!(page_of("Three"), Some(3));
+        assert_eq!(page_of("Charlie body."), Some(3));
+    }
+
+    /// A block is attributed to the page of its FIRST byte even when its text
+    /// spans a page boundary — the coarse-`Text` packing rule (#158).
+    #[test]
+    fn block_spanning_page_boundary_takes_first_byte_page() {
+        // A single running-text block (two paragraphs, no structural break)
+        // whose second paragraph starts after the page-2 offset. The whole
+        // Text block must still be attributed to page 1.
+        let md = "First paragraph on page one.\n\nSecond paragraph on page two.\n";
+        let boundary = md.find("Second").unwrap();
+        let page_starts = vec![(0usize, 1u32), (boundary, 2u32)];
+
+        let blocks = markdown_to_blocks_with_pages(md, &page_starts);
+        assert_eq!(blocks.len(), 1, "both paragraphs fold into one Text block");
+        assert_eq!(blocks[0].kind, BlockKind::Text);
+        assert!(blocks[0].text.contains("Second paragraph"));
+        assert_eq!(
+            blocks[0].location.as_ref().and_then(|l| l.page),
+            Some(1),
+            "the crossing block takes the page of its first byte"
+        );
+    }
+
+    /// An offset before the first `page_starts` entry attributes to the first
+    /// listed page (page 1 may contribute no content, so its start offset can
+    /// be > 0).
+    #[test]
+    fn offset_before_first_page_start_uses_first_page() {
+        let md = "Intro line.\n\n# Heading\n\nBody.\n";
+        // First recorded page starts at the heading, not at offset 0.
+        let heading = md.find("# Heading").unwrap();
+        let page_starts = vec![(heading, 5u32), (md.find("Body").unwrap(), 6u32)];
+
+        let blocks = markdown_to_blocks_with_pages(md, &page_starts);
+        let intro = blocks.iter().find(|b| b.text.contains("Intro")).unwrap();
+        assert_eq!(
+            intro.location.as_ref().and_then(|l| l.page),
+            Some(5),
+            "content before the first page start attributes to the first page"
+        );
+    }
+
+    /// #103 fingerprint: a repagination (same text/kinds, different page)
+    /// changes `compute_blocks_hash`, so the skip-check re-indexes instead of
+    /// leaving citations on stale pages.
+    #[test]
+    fn blocks_hash_changes_with_page() {
+        let block = |page: Option<u32>| Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Identical body text.".to_string(),
+            location: page.map(|p| BlockLocation {
+                page: Some(p),
+                ..Default::default()
+            }),
+        };
+        let h1 = compute_blocks_hash(&[block(Some(1))]);
+        let h2 = compute_blocks_hash(&[block(Some(2))]);
+        assert_ne!(h1, h2, "moving a block to a new page must change the hash");
+    }
+
+    /// A block with no page (every non-paginated format) hashes identically to
+    /// before page folding — the suffix is added only when a page is present,
+    /// so there is no spurious global reindex.
+    #[test]
+    fn blocks_hash_unchanged_without_page() {
+        let paged = Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Body.".to_string(),
+            location: Some(BlockLocation {
+                page: None,
+                ..Default::default()
+            }),
+        };
+        let no_loc = Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Body.".to_string(),
+            location: None,
+        };
+        // A location with page=None contributes no suffix, matching a block
+        // with no location at all and the pre-#103 `{kind}:{text}` hash.
+        assert_eq!(
+            compute_blocks_hash(&[paged]),
+            compute_blocks_hash(&[no_loc])
+        );
+        assert_eq!(
+            compute_blocks_hash(&[no_loc_block("Body.")]),
+            content_hash("text:Body.")
+        );
+    }
+
+    fn no_loc_block(text: &str) -> Block {
+        Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: text.to_string(),
+            location: None,
+        }
     }
 
     /// Frontmatter with CRLF line endings is detected correctly.
